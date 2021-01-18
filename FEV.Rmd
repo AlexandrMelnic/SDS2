@@ -1,0 +1,446 @@
+---
+title: 'SDS2 Project: FEV dataset'
+author: "Alexandru Melnic 1692625"
+output: 
+  prettydoc::html_pretty:
+    highlight: github
+    theme: cayman
+---
+```{r,include=FALSE}
+require(ggplot2)
+require(R2jags)
+require(bayesplot)
+require(LaplacesDemon)
+require(TeachingDemos)
+require(gridExtra)
+require(latex2exp)
+require(grid)
+require(coda)
+
+FEV_data = read.csv("C:/Users/sasha/Desktop/DS/SDS2/codes/FEVdataAge10to19.txt",sep="")
+y = FEV_data$FEV
+x1 = FEV_data$Age
+x2 = FEV_data$Smoke
+n = length(y)
+```
+### Dataset description
+The dataset contains records of 345 persons  about their Forced Expiratory Volume (FEV), age and information about them smoking or not.
+The data are noisy since the rate at which children grow (and their lungs) differ from child to child and also the amount of cigarettes consumed can vary a lot.
+The aim of the analysis is to predict the FEV given the age and smoking categorical variable. 
+```{r,fig.height=5, fig.width=15,echo=FALSE}
+answers = c("no","yes")
+Smoking = answers[FEV_data$Smoke+1]
+ggplot(FEV_data,aes(x=Age))+
+  geom_point(aes(y=FEV,col=Smoking))+
+  scale_x_continuous(breaks = seq(10,19,1))+
+  ggtitle("FEV vs Age")
+
+cont_table = data.frame(table(FEV_data$Age,answers[FEV_data$Smoke+1]))
+names(cont_table) = c("Age","Smoke","Count")
+
+ggplot(cont_table,aes(x=Age, fill=Smoke,y=Count))+
+  geom_bar(stat="identity")+
+  ggtitle("Age barplot")+
+  theme_minimal()
+
+cat("Fraction of smoking people: ",length(subset(FEV_data$Age, FEV_data$Smoke==1))/n,"%","Fraction of not smoking people:", length(subset(FEV_data$Age, FEV_data$Smoke==0))/n,"%")
+
+```
+The dataset is unbalaced towards the people not smoking. It is reasonable since most of the people are very young and it is very difficult to find someone smoking between them.
+
+
+### Models
+We are going to try 3 different models and at the end select the best of them according their DIC.
+For the first model we will assume that the target FEV is distributed normally with some mean $\mu_i$ and precision $\lambda$ where: $$ \mu_i = \beta_0+\beta_1\text{Age}_i+\beta_2\text{Smoke}_i$$ and at the end we have: $$ \text{FEV}_i \sim N(\beta_0+\beta_1\text{Age}_i+\beta_2\text{Smoke}_i, \lambda) $$
+The prior assumptions on the parameters are : $\beta_i \sim N(0,0.01)$ for $i \in \{1,2,3\}$ , since these distributions would give us a wide range of possibilities for the model,  and $\lambda \sim Gamma(r,s)$ with $r=0.5, s=1$. 
+
+For the second model we create an interaction variable between the 2 covariates. From this we suppose that the target variable is distributed as:
+$$ \text{FEV}_i \sim N(\beta_0+\beta_1\text{Age}_i+\beta_2\text{Smoke}_i + \beta_3\text{Age}_i\text{Smoke}_i,\lambda)$$ with same priors as the first model and $\beta_3 \sim N(0,0.01)$. 
+
+For the third and last model we suppose that $$\text{FEV}_i  \sim \text{ddexp}(\mu_i,\lambda)$$with again $\mu_i = \beta_0+\beta_1\text{Age}_i+\beta_2\text{Smoke}_i + \beta_3\text{Age}_i\text{Smoke}_i$ as for the previous model and same priors as before except the one for $\lambda$, that we suppose being distributed according $\text{dweib(1,1)}$.
+
+The goal of the computation is to estimate some important quantities from the posterior (for the second model in this case): 
+$$\pi(\beta,\lambda|FEV,Age,Smoke) \propto \Pi_iN(\beta_0+\beta_1\text{Age}_i+\beta_2\text{Smoke}_i + \beta_3\text{Age}_i\text{Smoke}_i,\lambda)N(0,0.01)^4Gamma(0.5,1)$$
+To do so we are going to implement a Markov chain that has as stationary distribution the posterior and in this way we can draw random variables from it and compute point and interval estimations.
+
+```{r}
+prec_beta0 = 0.01
+prec_beta1 = 0.01
+prec_beta2 = 0.01
+prec_beta3 = 0.01
+r = 0.5
+s = 1
+```
+
+```{r,echo=FALSE,fig.height=8, fig.width=15}
+p1 = qplot() + 
+  geom_line(aes(x=seq(0,5,0.01), y=dgamma(seq(0,5,0.01),rate=r,shape=s)))+
+  xlab(TeX("$\\lambda$"))+
+  ggtitle("Precision prior distribution for model 1 and 2")
+p2 = qplot()+
+  geom_line(aes(x=seq(0,5,0.01), y=dweibull(seq(0,5,0.01),1,1)))+
+  xlab(TeX("$\\lambda$"))+
+  ggtitle("Inverse of scale prior distribution for model 3")
+  grid.arrange(p1,p2,nrow=2)
+```
+
+
+### Markov Chain
+Now we are going to simulate the random variables from the joint posterior distribution from a MC using the $\texttt{r2jags}$ package. 
+```{r,results="hide",warning=FALSE}
+options(width=999)
+# first model
+model1 = function(){
+  for (i in 1:n){
+    y[i] ~ dnorm(mu[i],lambda)
+    mu[i] = beta0 + beta1*x1[i]+beta2*x2[i]
+  }
+  beta0 ~ dnorm(0,prec_beta0)
+  beta1 ~ dnorm(0,prec_beta1)
+  beta2 ~ dnorm(0,prec_beta2)
+  lambda ~ dgamma(s,r)
+}
+data1_jags = list("n", "y", "x1","x2","prec_beta0","prec_beta1","prec_beta2","s","r")
+model1_params = c("beta0","beta1","beta2","lambda")
+param1_inits = function(){
+  list("beta0" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta0)),
+       "beta1" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta1)),
+       "beta2" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta2)),
+       "lambda" = rgamma(n=1,shape=s,rate=r))
+}
+
+
+# second model
+model2 = function() {
+  for (i in 1:n){
+    y[i] ~ dnorm(mu[i],lambda)
+    mu[i] = beta0 + beta1*x1[i]+beta2*x2[i] + beta3*x1[i]*x2[i]
+  }
+  beta0 ~ dnorm(0,prec_beta0)
+  beta1 ~ dnorm(0,prec_beta1)
+  beta2 ~ dnorm(0,prec_beta2)
+  beta3 ~ dnorm(0,prec_beta3)
+  lambda ~ dgamma(s,r)
+}
+data2_jags = list("n", "y", "x1","x2","prec_beta0","prec_beta1","prec_beta2","prec_beta3","s","r")
+model2_params = c("beta0","beta1","beta2","beta3","lambda")
+param2_inits = function(){
+  list("beta0" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta0)),
+       "beta1" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta1)),
+       "beta2" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta2)),
+       "beta3" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta2)),
+       "lambda" = rgamma(n=1,shape=s,rate=r))  
+}
+
+
+# third model
+model3 = function(){
+    for (i in 1:n){
+    y[i] ~ ddexp(mu[i],lambda)
+    mu[i] = beta0 + beta1*x1[i]+beta2*x2[i] + beta3*x1[i]*x2[i]
+  }
+  beta0 ~ dnorm(0,prec_beta0)
+  beta1 ~ dnorm(0,prec_beta1)
+  beta2 ~ dnorm(0,prec_beta2)
+  beta3 ~ dnorm(0,prec_beta3)
+  lambda ~ dweib(1,1)
+}
+data3_jags = list("n", "y", "x1","x2","prec_beta0","prec_beta1","prec_beta2","prec_beta3")
+
+chain1 = jags(data=data1_jags,model.file=model1,inits=param1_inits, parameters.to.save=model1_params,
+             n.chains = 3, n.iter = 100000, n.burnin = 10000, n.thin=10)
+chain2 = jags(data=data2_jags,model.file=model2,inits=param2_inits, parameters.to.save=model2_params,
+             n.chains = 3, n.iter = 100000, n.burnin = 10000, n.thin=10)
+
+chain3 = jags(data=data3_jags,model.file=model3,inits=param2_inits, parameters.to.save=model2_params,
+             n.chains = 3, n.iter = 100000, n.burnin = 10000, n.thin=10)
+
+```
+
+
+First model:
+```{r,echo=FALSE}
+print(chain1)
+```
+Second model:
+```{r,echo=FALSE}
+print(chain2)
+```
+Third model:
+```{r,echo=FALSE}
+print(chain3)
+```
+
+
+
+At first sight the chains looks fine, we can compare the DIC for the  models:
+```{r,echo=FALSE}
+model1_DIC = chain1$BUGSoutput$DIC
+model2_DIC = chain2$BUGSoutput$DIC
+model3_DIC = chain3$BUGSoutput$DIC
+cat("model 1 DIC --> ", model1_DIC, "|||| model 2 DIC -->", model2_DIC, "|||| model 3 DIC -->", model3_DIC)
+```
+The second model performs better according the DIC scores, so from now we are going to analyse mainly this model.
+
+
+We can further verify the stability of the MC by plotting the traceplot of each chain. From the figures below we can seee that the chains are stabile and also we can see that the 3 chains converge to the same distributions. From the second plot we can see the autocorrelation functions of all the chains, and from this we can notice that already with lag=1 the acf is close to zero for all the parameters and this means that with good approximation the values of the chain are independent between them. 
+
+From the third plot we can verify the Geweke diagnostics which takes subsambles from the chain, cumputes the averages and verifies how much they differ between them representing the $Z$-score, i.e. standardizing them. From the latter diagnostics we can see that all the averages are close to zero and inside the 95% bands.
+```{r,fig.height=10, fig.width=15,echo=FALSE}
+chainArray = chain2$BUGSoutput$sims.array
+bayesplot::mcmc_combo(chainArray)
+bayesplot::mcmc_acf(chainArray)
+
+chain2_coda = as.mcmc(chain2)
+geweke.plot(chain2_coda[1])
+```
+
+
+
+We can also evaluate the approximation error from the variance of each parameter and the effective sample sizes. By evaluating the effective sample size we can compute the variance of the sample mean as: $\mathbb{Var}_{\pi(\beta,\lambda|y,x)}(\beta_i)/t_{eff}$.
+
+In the following table we have the effective sample sizes and the errors.
+
+```{r,echo=FALSE}
+options(width=999)
+print(t(data.frame(ESS=coda::effectiveSize(chain2_coda),error=chain2$BUGSoutput$summary[,2]/sqrt(coda::effectiveSize(chain2_coda)))))
+```
+
+In total the algorithm computed:
+```{r,echo=FALSE}
+cat(chain2$BUGSoutput$n.sims, "iterations")
+```
+The effectice sample sizes are close to the whole chain size and this gives us the lowest possible error on the estimation of the parameters averages. Overall the standard errors are hundreds of times smaller than the averages, so we can be sure that the estimations are good. 
+
+
+### Simulated data
+To check if the model works correctly we can simulate data from the same linear model with some fixed known parameters. If the model works fine then at the end the estimated parameters should be close to the real ones.
+```{r,results="hide",warning=FALSE}
+beta0_sim = 3
+beta1_sim = 3
+beta2_sim = 4
+beta3_sim = -2
+lambda_sim = 1
+
+x1_sim = sample(x=x1,replace=T)
+x2_sim = sample(x=x2,replace=T)
+
+mu_sim = beta0_sim + beta1_sim*x1_sim + beta2_sim*x2_sim +beta3_sim*x1_sim*x2_sim
+
+
+y_sim = rep(NA,length(y))
+for(i in 1:length(y)){
+  y_sim[i] = rnorm(n=1, mean=mu_sim[i], sd=1/sqrt(lambda_sim))
+}
+
+
+model_sim = function() {
+  for (i in 1:n){
+    y_sim[i] ~ dnorm(mu[i],lambda)
+    mu[i] = beta0 + beta1*x1_sim[i]+beta2*x2_sim[i] +beta3*x1_sim[i]*x2_sim[i]
+  }
+  beta0 ~ dnorm(0,prec_beta0)
+  beta1 ~ dnorm(0,prec_beta1)
+  beta2 ~ dnorm(0,prec_beta2)
+  beta3 ~ dnorm(0,prec_beta2)
+  lambda ~ dgamma(s,r)
+}
+
+
+data_sim_jags = list("n", "y_sim", "x1_sim","x2_sim","prec_beta0","prec_beta1","prec_beta2","prec_beta3","s","r")
+model_sim_params = c("beta0","beta1","beta2","beta3","lambda")
+
+
+param_sim_inits = function(){
+  list("beta0" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta0)),
+       "beta1" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta1)),
+       "beta2" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta2)),
+       "beta3" = rnorm(n=1,mean=0,sd=sqrt(1/prec_beta2)),
+       "lambda" = rgamma(n=1,shape=s,rate=r))
+}
+
+chain_sim = jags(data=data_sim_jags,model.file=model_sim,inits=param_sim_inits, 
+             parameters.to.save=model_sim_params,
+             n.chains = 3, n.iter = 100000, n.burnin = 10000, n.thin=10)
+
+```
+We can confront now the results we got for the simulated model:
+```{r,echo=FALSE,}
+print(data.frame(real=c(beta0_sim,beta1_sim,beta2_sim,beta3_sim,lambda_sim),
+                 "mean simulated"=c(chain_sim$BUGSoutput$summary[1:4,1],lambda=chain_sim$BUGSoutput$summary[6,1]),
+                 "sd simulated"=c(chain_sim$BUGSoutput$summary[1:4,2],lambda=chain_sim$BUGSoutput$summary[6,2])))
+```
+We can see that the model works well for the simulated data, the empirical averages of the parameters are very close to the real ones.
+
+
+
+### Inference
+
+As first step we can confront the prior and posterior distributions for all parameters. For the $\beta$ parameters we can't visualize them since the prior distributions have standard deviation of 10, meanwhile we can visualize the differences for the precision.
+
+```{r,fig.height=5, fig.width=15,echo=FALSE}
+p1 = qplot()+
+  geom_histogram(aes(x=chain2$BUGSoutput$sims.matrix[,6],y=..density..),col="black",fill="steelblue",alpha=0.8,bins=50)+
+  geom_line(aes(x=seq(-0,5,0.01),y=dgamma(seq(0,5,0.01),rate=r,shape=s)),col="red")+
+  xlab(TeX("$\\lambda$")) + ggtitle("Second model")
+p2 = qplot()+
+  geom_histogram(aes(x=chain3$BUGSoutput$sims.matrix[,6],y=..density..),col="black",fill="steelblue",alpha=0.8,bins=50)+
+  geom_line(aes(x=seq(-0,5,0.01),y=dweibull(seq(0,5,0.01),1,1)),col="red")+xlab(TeX("$\\lambda$")) + ggtitle("Third model")
+grid.arrange(p1,p2,ncol=2,top=textGrob("Confront between the priors (continuous line) and posterior histograms for the precision and inverse of scale"))
+```
+
+
+In the summary of the jags model we can see the estimated mean values of each parameter of the posterior distribution and the different estimated quantile levels. As seen in the previous plots all the distribution are quite symmetric and for this reason the mean, median and mode almost coincide and the equitail and hpd also almost coincide.
+
+We can also plot the 2 lines for the 2 smoking classes obtained by considering the mean values of the posterior for each parameter. 
+```{r,fig.height=5, fig.width=15,echo=FALSE}
+options(width=999)
+print(chain2$BUGSoutput$summary)
+hpd_beta0 = TeachingDemos::emp.hpd(chain2$BUGSoutput$sims.matrix[,1],conf=0.95)
+hpd_beta1 = TeachingDemos::emp.hpd(chain2$BUGSoutput$sims.matrix[,2],conf=0.95)
+hpd_beta2 = TeachingDemos::emp.hpd(chain2$BUGSoutput$sims.matrix[,3],conf=0.95)
+hpd_beta3 = TeachingDemos::emp.hpd(chain2$BUGSoutput$sims.matrix[,4],conf=0.95)
+hpd_lambda = TeachingDemos::emp.hpd(chain2$BUGSoutput$sims.matrix[,6],conf=0.95)
+
+
+hpds = rbind("beta0"=list("low"=hpd_beta0[1],"high"=hpd_beta0[2]), "beta1"=list("low"=hpd_beta1[1],"high"=hpd_beta1[2]) , "beta2"=list("low"=hpd_beta2[1],"high"=hpd_beta2[2]), "beta3" =list("low"=hpd_beta3[1],"high"=hpd_beta3[2]),
+             "lambda" =list("low"=hpd_lambda[1],"high"=hpd_lambda[2]) )
+
+# picking the average of each parameter
+mean_vec1 = chain1$BUGSoutput$summary[,1]
+# creating the predictions
+pred_fun1 = function(x1,x2) mean_vec1[1] + mean_vec1[2]*x1 + mean_vec1[3]*x2 
+# confidence bands
+pred_fun2_low = function(x1,x2) {
+  chain2$BUGSoutput$summary[1,3] + chain2$BUGSoutput$summary[2,3]*x1 + chain2$BUGSoutput$summary[3,3]*x2 + chain2$BUGSoutput$summary[4,3]*x1*x2
+}
+pred_fun2_high = function(x1,x2) {
+  chain2$BUGSoutput$summary[1,7] + chain2$BUGSoutput$summary[2,7]*x1 + chain2$BUGSoutput$summary[3,7]*x2  +chain2$BUGSoutput$summary[4,7]*x1*x2
+}
+p1 = ggplot(FEV_data,aes(x=Age))+
+  geom_point(aes(y=FEV,col=Smoking))+
+  geom_line(aes(x=x1, y=pred_fun1(x1,1)),col="black")+
+  geom_line(aes(x=x1, y=pred_fun1(x1,0)),col="black",linetype="dashed")+
+  scale_x_continuous(breaks = seq(10,19,1))+
+  ggtitle("Prediction obtained by model1")
+  
+mean_vec2 = chain2$BUGSoutput$summary[,1]
+pred_fun2 = function(x1,x2) mean_vec2[1] + mean_vec2[2]*x1 + mean_vec2[3]*x2 + mean_vec2[4]*x1*x2
+p2 = ggplot(FEV_data,aes(x=Age,y=FEV))+
+  geom_point(aes(col=Smoking))+
+  geom_line(aes( y=pred_fun2(x1,1)),col="black")+
+  geom_line(aes( y=pred_fun2(x1,0)),col="black",linetype="dashed")+
+  scale_x_continuous(breaks = seq(10,19,1))+
+  ggtitle("Prediction obtained by model2")
+  
+grid.arrange(p1,p2,ncol=2,top=textGrob("Dashed line stands for non smokers"))
+
+
+```
+In the first model the two lines are parallel, so the difference depends only on the parameter $\beta_2$. Meanwhile in the second model we introduced a mixed term that is able to better capture the difference between smokers and non smokers, that also give us a better DIC score. 
+
+HPD intervals at level 95%:
+```{r,echo=FALSE}
+print(hpds)
+```
+
+We can see that the HPD intervals are very close to the equitail ones.
+
+
+
+From the first model the rates (in $liter/age$) for which the FEV increase are the same for the 2 classes, the only difference is given by the intercept.
+This difference is:
+```{r,echo=FALSE}
+print(mean_vec1[3])
+```
+
+
+
+For the second model instead we have that the 2 rates are different and they are given by: $\beta_1$ for non smokers and $\beta_1+\beta_3$ for the smokers.
+```{r,echo=FALSE}
+confront_rates_model2 = data.frame("smokers"=mean_vec2[2]+mean_vec2[4],"non smokers"=mean_vec2[2])
+rownames(confront_rates_model2) = c("rate")
+print(confront_rates_model2)
+```
+We can notice that the rate at which the FEV increases is 3 times bigger for the non smokers.
+
+
+We can also check the extreme values of the rates, i.e. confront which is the lowest rate for smokers and highest rate for non smokers. This can be done by taking the values of $\beta_1$ at quantile level 97.5% and $\beta_3$ at 2.5%.
+
+Extremal rates:
+
+```{r,echo=FALSE}
+print(data.frame("smokers"=chain2$BUGSoutput$summary[2,7]+chain2$BUGSoutput$summary[4,3],"non smokers"=chain2$BUGSoutput$summary[2,7]))
+```
+Example of extremal fit can be found in the following graph:
+```{r,echo=FALSE}
+pred_fun_extremal = function(x1,x2) mean_vec2[1] + chain2$BUGSoutput$summary[2,7]*x1 + mean_vec2[3]*x2 + chain2$BUGSoutput$summary[4,3]*x1*x2
+ggplot(FEV_data,aes(x=Age,y=FEV))+
+  geom_point(aes(col=Smoking))+
+  geom_line(aes( y=pred_fun_extremal(x1,1)),col="black")+
+  geom_line(aes( y=pred_fun_extremal(x1,0)),col="black",linetype="dashed")+
+  scale_x_continuous(breaks = seq(10,19,1))+
+  ggtitle("Extremal fit")
+```
+
+
+From the last plot we can notice that for smokers the FEV almost doesn't increase during the age, it means that there could exist cases where a person of 20 years old has a lung capacity of a 10 years old child.  
+
+
+The next step is predicting the FEV for smokers and non smokers at the same age. We evaluate the posterior predictive distribution $m(y_{new}|y)$ as: 
+$$ m(y_{new}|y_{old}) = \int f(y_{new}|\theta)\pi(\theta|y_{old})d\theta=\mathbb{E}_{\pi(\theta|y_{old})}[f(y_{new}|\theta)]$$
+where $f$ is the conditional model as described in the Models section and the expectation is respect to the posterior distribution, for this reason we can estimate it using the samples we obtained from the MC. We are using again the third model for the prediction.
+```{r}
+matrix_sim = chain2$BUGSoutput$sims.matrix
+posterior_predictive = function(y_new,x1_new,x2_new){
+  sum = 0
+  for (i in 1:chain2$BUGSoutput$n.sims){
+    sum = sum + dnorm(x=y_new, mean=matrix_sim[,1][i]+matrix_sim[,2][i]*x1_new+matrix_sim[,3][i]*x2_new+matrix_sim[,4][i]*x1_new*x2_new,sd=1/sqrt(matrix_sim[,6][i]))
+  }
+  return(sum/chain2$BUGSoutput$n.sims)
+  #dnorm(x=y_new, mean=beta0+beta1*x1_new+beta2*x2_new+beta3*x1_new*x2_new,sd=1/sqrt(lambda))
+}
+
+x_seq_pred = seq(0,10,0.01)
+pred_df = data.frame(x=x_seq_pred, smokers=posterior_predictive(x_seq_pred,18,1),non_smokers=posterior_predictive(x_seq_pred,18,0))
+ggplot(pred_df)+
+  geom_line(aes(x=x,col="smokers",y=smokers))+
+  geom_line(aes(x=x,col="non smokers",y=non_smokers))+
+  ylab("")+xlab("FEV")+ggtitle("FEV prediction for age 18")+labs(col="")+
+  scale_x_continuous(breaks = seq(0,10,1))
+```
+
+As expected in average non smokers have a higher FEV than smokers.
+
+
+We want now to perform an hypotesis testing, setting the hypothesis $H_0:(\beta_0,\beta_1,\beta_2,\beta_3)=(0,0,0,0)$ and
+$H_1:(\beta_0,\beta_1,\beta_2,\beta_3) \ne(0,0,0,0)$. 
+From the intervals evaluated in the previous points we can see that the vector $(0,0,0,0)$ is outside the 95% credible interval, so we can decide in favor of $H_1$.
+```{r,echo=FALSE}
+print(hpds)
+```
+
+
+
+
+### Frequentist vs Bayesian
+We can confront our Bayesian approach with the frequentist one. For the latter we can use a simple linear regression, and confront the estimated parameters with the one of the Bayesian model. 
+```{r}
+# We apply the model with the mixed parameters
+reg = lm(y ~ x1 +x2 + x1*x2)
+summary(reg)
+```
+We see that the p-values are all very low, that is good for the model.
+
+
+Un unbiased estimator of the variance of the response is given by: $$ \hat{\sigma}^2 = \frac{1}{n-p}\sum_{i=1}^nr_i^2 $$ with $p$ the number of covariates and $r_i$ the risiduals. 
+
+In the following table we confront all the parameters obtained with the frequentist approach with the empirical averages of the posterior distributions of the Bayesian approach of the second model.
+```{r,echo=FALSE}
+freq_precision = (n-3)/sum(reg$residuals**2)
+print(rbind("Bayesian"=c(chain2$BUGSoutput$summary[1:4,1],lambda=chain2$BUGSoutput$summary[6,1]),"frequentist"= c(reg$coefficients,freq_precision)))
+```
+
+### Conclusions
+
+As seen in all the inference part smoking reduces (sometimes by a lot as shown in the extremal fit case) the lungs capacity. The Markov chains were stabile as verified in the Markov Chain part and also the linear model is appropriate as seen in the simuation part and also since it gave very similar result to the linear regression in the frequentist case. 
